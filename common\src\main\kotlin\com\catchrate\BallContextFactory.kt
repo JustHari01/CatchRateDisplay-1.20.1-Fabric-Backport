@@ -1,0 +1,313 @@
+package com.catchrate
+
+import com.catchrate.BallMultiplierCalculator.BallContext
+import com.catchrate.BallMultiplierCalculator.PartyMember
+import com.catchrate.CatchRateConstants.MOON_BALL_GATE_END
+import com.catchrate.CatchRateConstants.MOON_BALL_GATE_START
+import com.cobblemon.mod.common.api.tags.CobblemonBiomeTags
+import com.cobblemon.mod.common.api.battles.model.actor.ActorType
+import com.cobblemon.mod.common.client.CobblemonClient
+import com.cobblemon.mod.common.client.battle.ClientBattle
+import com.cobblemon.mod.common.client.battle.ClientBattlePokemon
+import com.cobblemon.mod.common.entity.PoseType
+import com.cobblemon.mod.common.entity.pokemon.PokemonEntity
+import com.cobblemon.mod.common.pokemon.Gender
+import com.cobblemon.mod.common.pokemon.Pokemon
+import net.minecraft.client.Minecraft
+import net.minecraft.core.BlockPos
+import net.minecraft.resources.ResourceLocation
+import net.minecraft.world.entity.player.Player
+import net.minecraft.world.level.Level
+
+/**
+ * Factory for creating BallContext objects from different Pokemon sources.
+ * Centralizes context building logic that was duplicated across:
+ * - BallComparisonCalculator.buildBattleContext()
+ * - BallComparisonCalculator.buildWorldContext()
+ * - CatchRateHudRenderer client-side context building
+ */
+object BallContextFactory {
+
+    /**
+     * Whether the Moon Ball bonus is active for the given level, matching Cobblemon's real
+     * (version-dependent) guard rather than a naive day/night check.
+     *
+     * Pre-1.8.1: Cobblemon gated the bonus on the world's total elapsed ticks (gameTime) sitting
+     * outside 12000..24000 — a bug, since gameTime never wraps, so the bonus is only correctly
+     * denied during the world's first in-game night and is permanently active every day after.
+     * Fixed in 1.8.1 to check actual time-of-day (dayTime % 24000), so the bonus is now really
+     * night-only as the ball's name implies.
+     */
+    private fun isMoonBallGateOpen(level: Level): Boolean {
+        return when (CobblemonVersionSupport.catchMechanicsProfile()) {
+            CobblemonVersionSupport.CatchMechanicsProfile.LEGACY_PRE_181 ->
+                level.gameTime !in MOON_BALL_GATE_START..MOON_BALL_GATE_END
+            CobblemonVersionSupport.CatchMechanicsProfile.FIXED_181 ->
+                level.dayTime % 24000L >= 12000L
+        }
+    }
+
+    /**
+     * Create a BallContext from a ClientBattlePokemon (client-side battle).
+     * Used by BallComparisonCalculator for in-battle calculations.
+     */
+    fun fromBattlePokemon(
+        pokemon: ClientBattlePokemon,
+        turnCount: Int,
+        player: Player,
+        level: Level,
+        battle: ClientBattle?
+    ): BallContext {
+        val species = pokemon.species
+        val aspects = getPokemonAspectsFromBattle(pokemon)
+        val targetEntity = getBattleTargetEntity(pokemon, battle, player, level)
+        val targetUnderwater = targetEntity?.isUnderWater ?: false
+        val targetPos = targetEntity?.blockPosition() ?: player.blockPosition()
+        CatchRateMod.debugOnChange(
+            "BattleTargetWater",
+            "${pokemon.uuid}_${targetEntity?.uuid}_${targetUnderwater}",
+            "Battle target ${species.name}: entity=${targetEntity?.uuid ?: "none"}, underwater=$targetUnderwater"
+        )
+        
+        return BallContext(
+            speciesId = species.resourceIdentifier.toString(),
+            level = pokemon.level,
+            gender = safeParseGender(pokemon.gender.name),
+            primaryType = species.primaryType.name,
+            secondaryType = species.secondaryType?.name,
+            weight = species.weight,
+            baseSpeed = getBaseSpeed(species.baseStats),
+            labels = safeGetLabels(species),
+            statusPath = pokemon.status?.name?.path,
+            lightLevel = level.getMaxLocalRawBrightness(targetPos),
+            moonBallGateOpen = isMoonBallGateOpen(level),
+            moonPhase = level.moonPhase,
+            isTargetUnderwater = targetUnderwater,
+            isPlayerUnderwater = player.isUnderWater,
+            isTemperateBiome = isTemperateBiome(level, player.blockPosition()),
+            inBattle = true,
+            turnCount = turnCount,
+            quickBallBonusConsumed = CatchRateCaptureTracker.hasConsumedQuickBallBonus(battle?.battleId, pokemon.uuid),
+            activeBattler = getActiveBattlerFromClientBattle(battle),
+            hasCaughtSpecies = checkHasCaughtSpecies(species.resourceIdentifier),
+            pokemonAspects = aspects
+        )
+    }
+    
+    /**
+     * Create a BallContext from a PokemonEntity (client-side world Pokemon).
+     * Used by BallComparisonCalculator for out-of-battle calculations.
+     *
+     * Detects sleeping via PoseType since Cobblemon sets the persistent Sleep status
+     * server-side but doesn't sync it to clients — the synced POSE_TYPE entity data
+     * is the only reliable client-side indicator.
+     */
+    fun fromWorldPokemon(
+        entity: PokemonEntity,
+        player: Player,
+        level: Level
+    ): BallContext {
+        val pokemon = entity.pokemon
+        val effectiveStatus = getEffectiveStatusPath(entity)
+        CatchRateMod.debugOnChange("Context", "${entity.uuid}_${entity.aspects}_${effectiveStatus}",
+            "fromWorldPokemon: ${pokemon.species.name} UUID=${entity.uuid} | entity.aspects=${entity.aspects} | pose=${entity.getCurrentPoseType()} | effectiveStatus=$effectiveStatus")
+        return fromPokemon(
+            pokemon, player, level,
+            inBattle = false, turnCount = 0, activeBattler = null,
+            hasCaughtSpecies = checkHasCaughtSpecies(pokemon.species.resourceIdentifier),
+            isTargetUnderwater = entity.isUnderWater,
+            pokemonAspects = entity.aspects,
+            statusOverride = effectiveStatus,
+            targetPos = entity.blockPosition()
+        )
+    }
+    
+    /**
+     * Create a BallContext from a Pokemon object (shared logic).
+     * Can be used for both world Pokemon and server-side calculations.
+     */
+    fun fromPokemon(
+        pokemon: Pokemon,
+        player: Player,
+        level: Level,
+        inBattle: Boolean,
+        turnCount: Int,
+        activeBattler: PartyMember?,
+        hasCaughtSpecies: Boolean? = null,
+        isTargetUnderwater: Boolean = false,
+        pokemonAspects: Set<String> = emptySet(),
+        statusOverride: String? = null,
+        targetPos: BlockPos = player.blockPosition()
+    ): BallContext {
+        val species = pokemon.species
+
+        return BallContext(
+            speciesId = species.resourceIdentifier.toString(),
+            level = pokemon.level,
+            gender = pokemon.gender,
+            primaryType = pokemon.primaryType.name,
+            secondaryType = pokemon.secondaryType?.name,
+            weight = species.weight,
+            baseSpeed = getBaseSpeed(species.baseStats),
+            labels = safeGetLabels(species),
+            statusPath = statusOverride ?: pokemon.status?.status?.name?.path,
+            lightLevel = level.getMaxLocalRawBrightness(targetPos),
+            moonBallGateOpen = isMoonBallGateOpen(level),
+            moonPhase = level.moonPhase,
+            isTargetUnderwater = isTargetUnderwater,
+            isPlayerUnderwater = player.isUnderWater,
+            isTemperateBiome = isTemperateBiome(level, player.blockPosition()),
+            inBattle = inBattle,
+            turnCount = turnCount,
+            quickBallBonusConsumed = false,
+            activeBattler = activeBattler,
+            hasCaughtSpecies = hasCaughtSpecies,
+            pokemonAspects = pokemonAspects
+        )
+    }
+    
+
+    
+    // ==================== HELPER METHODS ====================
+    
+    /**
+     * Check if the client Pokédex data has actually been synced from the server.
+     * Empty speciesRecords indicates data hasn't arrived yet (common on multiplayer servers).
+     */
+    private fun isPokedexSynced(): Boolean {
+        // Cobblemon 1.5.2 (the supported 1.20.1 release) does not expose client Pokédex data.
+        // Keep Repeat Ball predictions marked as estimates rather than claiming a false result.
+        return false
+    }
+
+    /**
+     * Check if the player has caught this species using the client-synced Pokédex.
+     * Returns null if the Pokédex isn't synced or the check fails.
+     */
+    private fun checkHasCaughtSpecies(speciesId: ResourceLocation): Boolean? {
+        if (!isPokedexSynced()) return null
+        return null
+    }
+    
+    /**
+     * Get Pokemon aspects from ClientBattlePokemon via its FloatingState.
+     * The private `aspects` field is mirrored to `state.currentAspects` which is accessible.
+     * This includes persistent aspects like "fished" from fishing encounters.
+     */
+    private fun getPokemonAspectsFromBattle(pokemon: ClientBattlePokemon): Set<String> {
+        return try {
+            val aspects = pokemon.aspects
+            CatchRateMod.debugOnChange("Aspects", "${pokemon.species.name}_${aspects}",
+                "${pokemon.species.name} battle aspects: $aspects")
+            aspects
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("AspectsErr", pokemon.species.name, "Could not get battle pokemon aspects: ${e.message}")
+            emptySet()
+        }
+    }
+    
+    private fun getActiveBattlerFromClientBattle(battle: ClientBattle?): PartyMember? {
+        if (battle == null) return null
+        return try {
+            val activePokemon = battle.side1.activeClientBattlePokemon.firstOrNull()?.battlePokemon
+            if (activePokemon != null) {
+                PartyMember(
+                    speciesId = activePokemon.species.resourceIdentifier.toString(),
+                    gender = safeParseGender(activePokemon.gender.name),
+                    level = activePokemon.level
+                )
+            } else null
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("BattleErr", "activeBattler", "Could not access active battler: ${e.message}")
+            null
+        }
+    }
+
+    private fun getBattleTargetEntity(
+        pokemon: ClientBattlePokemon,
+        battle: ClientBattle?,
+        player: Player,
+        level: Level
+    ): PokemonEntity? {
+        val battleId = battle?.battleId ?: return null
+        return try {
+            val wildEntities = level.getEntitiesOfClass(
+                PokemonEntity::class.java,
+                player.boundingBox.inflate(128.0)
+            ) {
+                it.isAlive &&
+                    it.battleId == battleId &&
+                    it.ownerUUID == null &&
+                    it.pokemon.getOwnerUUID() == null
+            }
+
+            val wildPokemonUuid = battle.sides.asSequence()
+                .flatMap { it.activeClientBattlePokemon.asSequence() }
+                .firstOrNull { it.actor.type == ActorType.WILD }
+                ?.battlePokemon?.uuid
+            wildEntities.firstOrNull { it.pokemon.uuid == pokemon.uuid }
+                ?: wildPokemonUuid?.let { wildUuid -> wildEntities.firstOrNull { it.pokemon.uuid == wildUuid } }
+                ?: wildEntities.singleOrNull()
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("BattleTargetErr", pokemon.uuid.toString(), "Could not resolve battle target entity: ${e.message}")
+            null
+        }
+    }
+    
+    /**
+     * Checks if the player is standing in a biome tagged cobblemon:is_temperate,
+     * mirroring Cobblemon's own Park Ball catch rate modifier.
+     */
+    private fun isTemperateBiome(level: Level, pos: BlockPos): Boolean {
+        return try {
+            level.getBiome(pos).`is`(CobblemonBiomeTags.IS_TEMPERATE)
+        } catch (e: Throwable) {
+            false
+        }
+    }
+
+    private fun safeParseGender(genderName: String): Gender? {
+        return try {
+            Gender.valueOf(genderName)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+    
+    private fun safeGetLabels(species: com.cobblemon.mod.common.pokemon.Species): List<String> {
+        return try {
+            species.labels.toList()
+        } catch (e: Throwable) {
+            emptyList()
+        }
+    }
+    
+    private fun getBaseSpeed(baseStats: Map<out Any, Int>): Int {
+        // Direct lookup via Cobblemon's Stats enum avoids iterating all stats with string matching
+        try {
+            val speedStat = com.cobblemon.mod.common.api.pokemon.stats.Stats.SPEED
+            baseStats[speedStat]?.let { return it }
+        } catch (_: Throwable) { /* Fall through to string-based lookup */ }
+        // Fallback for compatibility
+        return baseStats.entries.find { entry ->
+            entry.key.toString().let { k ->
+                k.equals("spe", ignoreCase = true) || k.equals("SPEED", ignoreCase = true)
+            }
+        }?.value ?: 0
+    }
+    
+    /**
+     * Get the effective status path for a world PokemonEntity.
+     * Cobblemon sets Sleep status server-side when Pokémon rest, but doesn't sync it
+     * to clients. The synced POSE_TYPE entity data is the reliable client-side indicator.
+     */
+    fun getEffectiveStatusPath(entity: PokemonEntity): String? {
+        // Check the pokemon data status first (works if it happens to be synced)
+        val dataStatus = entity.pokemon.status?.status?.name?.path
+        if (dataStatus != null) return dataStatus
+        // Fall back to PoseType for sleep detection
+        return try {
+            if (entity.getCurrentPoseType() == PoseType.SLEEP) "sleep" else null
+        } catch (e: Throwable) { null }
+    }
+}

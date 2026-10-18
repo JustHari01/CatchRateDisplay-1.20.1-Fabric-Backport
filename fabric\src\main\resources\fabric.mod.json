@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "catchrate-display",
+  "version": "${version}",
+  "name": "Cobblemon Catch Rate Display (1.20.1 Backport)",
+  "description": "Unofficial Fabric 1.20.1 backport of Akkiruk's MIT-licensed Cobblemon Catch Rate Display. Shows catch chance, ball effectiveness, status bonuses, and HP impact on the client. AI-assisted community backport prepared for JustHari01.",
+  "authors": ["Akkiruk", "JustHari01"],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/catchrate-display",
+    "sources": "https://github.com/JustHari01/CatchRateDisplay-1.20.1-Fabric-Backport",
+    "issues": "https://github.com/JustHari01/CatchRateDisplay-1.20.1-Fabric-Backport/issues"
+  },
+  "license": "MIT",
+  "icon": "assets/catchrate-display/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      {
+        "adapter": "kotlin",
+        "value": "com.catchrate.fabric.CatchRateDisplayFabric"
+      }
+    ],
+    "client": [
+      {
+        "adapter": "kotlin",
+        "value": "com.catchrate.fabric.CatchRateDisplayFabricClient"
+      }
+    ]
+  },
+  "mixins": [
+    "catchrate-display-common.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.10",
+    "minecraft": "1.20.1",
+    "cobblemon": ">=1.5.2 <1.6.0",
+    "fabric-language-kotlin": ">=1.12.3",
+    "fabric-api": ">=0.92.6"
+  },
+  "custom": {
+    "modmenu": {
+      "links": {
+        "modmenu.wiki": "https://github.com/Akkiruk/catchrate-display/wiki"
+      }
+    }
+  }
+}

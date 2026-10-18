@@ -1,0 +1,349 @@
+package com.catchrate.client
+
+import com.catchrate.BallContextFactory
+import com.catchrate.BallMultiplierCalculator
+import com.catchrate.ExternalCatchRateModifiers
+import com.catchrate.CatchRatePredictionReliability
+import com.catchrate.CatchRateMod
+import com.catchrate.CatchRateFormula
+import com.catchrate.SpeciesCatchRateCache
+import com.catchrate.api.CatchRateBallRegistry
+import com.catchrate.compat.AtmBallCompat
+import com.cobblemon.mod.common.client.battle.ClientBattle
+import com.cobblemon.mod.common.client.battle.ClientBattlePokemon
+import com.cobblemon.mod.common.entity.pokemon.PokemonEntity
+import net.minecraft.client.Minecraft
+import net.minecraft.core.registries.BuiltInRegistries
+import net.minecraft.world.phys.EntityHitResult
+import net.minecraft.world.phys.HitResult
+
+/**
+ * Client-side calculator that computes catch rates for Pokemon.
+ * 
+ * Uses:
+ * - BallMultiplierCalculator for ball-specific multipliers
+ * - BallContextFactory for building context objects
+ * - CatchRateFormula for catch rate math (single source of truth)
+ * 
+ * Handles both in-battle and out-of-battle scenarios.
+ */
+object BallComparisonCalculator {
+    
+    private val baseComparableBalls = listOf(
+        "quick_ball", "ultra_ball", "timer_ball", "dusk_ball", "net_ball", "dive_ball",
+        "nest_ball", "repeat_ball", "great_ball", "level_ball", "love_ball", "heavy_ball",
+        "fast_ball", "moon_ball", "dream_ball", "lure_ball", "friend_ball", "luxury_ball",
+        "heal_ball", "premier_ball", "poke_ball", "safari_ball", "sport_ball", "beast_ball"
+    )
+
+    @Volatile
+    private var cachedRegisteredBallIds: List<String>? = null
+
+    /** Ball IDs registered through the public CatchRateBallRegistry API whose item is installed. */
+    private fun installedRegisteredBallIds(): List<String> {
+        cachedRegisteredBallIds?.let { return it }
+        val installed = CatchRateBallRegistry.registeredIds()
+            .filter { BuiltInRegistries.ITEM.containsKey(it) }
+            .map { it.toString() }
+        cachedRegisteredBallIds = installed
+        return installed
+    }
+
+    private fun comparableBalls(): List<String> {
+        val withAtm = AtmBallCompat.extendComparableBalls(baseComparableBalls)
+        val registered = installedRegisteredBallIds()
+        return if (registered.isEmpty()) withAtm else withAtm + registered
+    }
+    
+    // Pokemon lookup cache to avoid expensive entity queries every frame
+    private var cachedLookedAtPokemon: PokemonEntity? = null
+    private var lastPokemonLookupFrame = 0L
+    private const val POKEMON_LOOKUP_INTERVAL_FRAMES = 3L
+    private var lookupFrameCounter = 0L
+    
+    data class BallCatchRate(
+        val ballName: String,
+        val displayName: String,
+        val catchRate: Double,
+        val multiplier: Double,
+        val conditionMet: Boolean,
+        val reason: String,
+        val isGuaranteed: Boolean = false,
+        val isCatchRateEstimate: Boolean = false,
+        val isPredictionReliable: Boolean = true
+    )
+    
+    /**
+     * Calculate catch rates for all balls during battle.
+     */
+    fun calculateAllBalls(pokemon: ClientBattlePokemon, turnCount: Int, battle: ClientBattle?): List<BallCatchRate> {
+        return try {
+            calculateAllBallsInternal(pokemon, turnCount, battle)
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("CompErr", "allBalls", "calculateAllBalls failed: ${e.javaClass.simpleName}: ${e.message}")
+            emptyList()
+        }
+    }
+    
+    private fun calculateAllBallsInternal(pokemon: ClientBattlePokemon, turnCount: Int, battle: ClientBattle?): List<BallCatchRate> {
+        val minecraft = Minecraft.getInstance()
+        val player = minecraft.player ?: return emptyList()
+        val level = minecraft.level ?: return emptyList()
+        
+        val ctx = BallContextFactory.fromBattlePokemon(pokemon, turnCount, player, level, battle)
+        val reliability = CatchRatePredictionReliability.analyzeBattleTarget(pokemon, battle)
+        val effectiveSpecies = reliability.effectiveSpecies ?: pokemon.species
+        val preservedSpecies = effectiveSpecies.resourceIdentifier != pokemon.species.resourceIdentifier
+        if (!reliability.isReliable || preservedSpecies) {
+            CatchRateMod.debugOnChange(
+                "ComparisonReliability",
+                "${pokemon.uuid}_${effectiveSpecies.name}",
+                if (preservedSpecies) {
+                    "Using remembered species ${effectiveSpecies.name} while battle client displays ${pokemon.species.name}: ${reliability.reason}"
+                } else {
+                    "Ball comparison marked approximate for ${pokemon.species.name}: ${reliability.reason}"
+                }
+            )
+        }
+        
+        val hpInfo = CatchRateFormula.calculateHpInfo(
+            hpValue = pokemon.hpValue,
+            maxHpValue = pokemon.maxHp,
+            isFlat = pokemon.isHpFlat
+        )
+        
+        val baseCatchRate = SpeciesCatchRateCache.getCatchRate(effectiveSpecies, ctx.pokemonAspects).toFloat()
+        val isEstimate = SpeciesCatchRateCache.isEstimate(effectiveSpecies, ctx.pokemonAspects)
+        val statusMult = CatchRateFormula.getStatusMultiplier(pokemon.status?.name?.path)
+        val levelBonus = CatchRateFormula.getLowLevelBonus(pokemon.level)
+        val externalCatchRateMultiplier = ExternalCatchRateModifiers.combinedMultiplier(
+            ExternalCatchRateModifiers.collect(player)
+        )
+        
+        return comparableBalls().map { ballId ->
+            val result = BallMultiplierCalculator.calculate(ballId, ctx)
+            
+            // Compute modified rate once per ball, derive percentage (avoids duplicate HP/modifier math x24 balls)
+            val modifiedRate = CatchRateFormula.calculateModifiedCatchRate(
+                baseCatchRate = baseCatchRate,
+                maxHp = hpInfo.maxHp,
+                currentHp = hpInfo.currentHp,
+                ballMultiplier = result.multiplier,
+                statusMultiplier = statusMult,
+                levelBonus = levelBonus,
+                inBattle = true,
+                externalCatchRateMultiplier = externalCatchRateMultiplier
+            )
+            val isFormulaGuaranteed = result.isGuaranteed || CatchRateFormula.isGuaranteedByFormula(modifiedRate)
+            val catchChance = if (isFormulaGuaranteed) 100F else CatchRateFormula.modifiedRateToPercentage(modifiedRate)
+            
+            BallCatchRate(
+                ballName = ballId,
+                displayName = CatchRateFormula.formatBallName(ballId),
+                catchRate = catchChance.toDouble().coerceIn(0.0, 100.0),
+                multiplier = result.multiplier.toDouble(),
+                conditionMet = result.conditionMet,
+                reason = result.reason,
+                isGuaranteed = isFormulaGuaranteed,
+                isCatchRateEstimate = isEstimate,
+                isPredictionReliable = reliability.isReliable
+            )
+        }.sortedByDescending { it.catchRate }
+    }
+    
+    /**
+     * Calculate catch rate for a world Pokemon (out of combat).
+     */
+    fun calculateForWorldPokemon(entity: PokemonEntity, ballId: String): BallCatchRate? {
+        return try {
+            calculateForWorldPokemonInternal(entity, ballId)
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("WorldCalcErr", "worldPokemon", "calculateForWorldPokemon failed: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+    }
+    
+    private fun calculateForWorldPokemonInternal(entity: PokemonEntity, ballId: String): BallCatchRate? {
+        val minecraft = Minecraft.getInstance()
+        val player = minecraft.player ?: return null
+        val level = minecraft.level ?: return null
+        
+        val pokemon = entity.pokemon
+        
+        val ctx = BallContextFactory.fromWorldPokemon(entity, player, level)
+        
+        val result = BallMultiplierCalculator.calculate(ballId, ctx)
+        val reliability = CatchRatePredictionReliability.analyzeWorldTarget(entity)
+        
+        val baseCatchRate = SpeciesCatchRateCache.getCatchRate(pokemon.species, ctx.pokemonAspects).toFloat()
+        val isEstimate = SpeciesCatchRateCache.isEstimate(pokemon.species, ctx.pokemonAspects)
+        val maxHp = pokemon.hp.toFloat()
+        val currentHp = pokemon.currentHealth.toFloat()
+        val statusMult = CatchRateFormula.getStatusMultiplier(BallContextFactory.getEffectiveStatusPath(entity))
+        val levelBonus = CatchRateFormula.getLowLevelBonus(pokemon.level)
+        val externalCatchRateMultiplier = ExternalCatchRateModifiers.combinedMultiplier(
+            ExternalCatchRateModifiers.collect(player)
+        )
+        
+        val catchChance = CatchRateFormula.calculateCatchPercentage(
+            baseCatchRate = baseCatchRate,
+            maxHp = maxHp,
+            currentHp = currentHp,
+            ballMultiplier = result.multiplier,
+            statusMultiplier = statusMult,
+            levelBonus = levelBonus,
+            inBattle = false,
+            externalCatchRateMultiplier = externalCatchRateMultiplier
+        )
+        
+        CatchRateMod.debugOnChange("WorldCalc",
+            "${pokemon.species.name}_${ballId}_${currentHp.toInt()}_${statusMult}",
+            "${pokemon.species.name} Lv${pokemon.level} | Ball: $ballId ${result.multiplier}x (${result.reason}) | " +
+            "Base: $baseCatchRate | HP: ${currentHp.toInt()}/${maxHp.toInt()} | Status: ${statusMult}x | " +
+            "Level bonus: ${levelBonus}x | Out-of-combat: 0.5x | Final: ${String.format("%.1f", catchChance)}%"
+        )
+        
+        val isFormulaGuaranteed = result.isGuaranteed || catchChance >= 100F
+        val finalChance = if (isFormulaGuaranteed) 100.0 else catchChance.toDouble().coerceIn(0.0, 100.0)
+
+        return BallCatchRate(
+            ballName = ballId,
+            displayName = CatchRateFormula.formatBallName(ballId),
+            catchRate = finalChance,
+            multiplier = result.multiplier.toDouble(),
+            conditionMet = result.conditionMet,
+            reason = result.reason,
+            isGuaranteed = isFormulaGuaranteed,
+            isCatchRateEstimate = isEstimate,
+            isPredictionReliable = reliability.isReliable
+        )
+    }
+    
+    /**
+     * Calculate catch rates for all balls for a world Pokemon (out of combat).
+     * Uses party lead as the "active battler" for Love Ball / Level Ball relevance.
+     */
+    fun calculateAllBallsForWorld(entity: PokemonEntity): List<BallCatchRate> {
+        return try {
+            calculateAllBallsForWorldInternal(entity)
+        } catch (e: Throwable) {
+            CatchRateMod.debugOnChange("CompErr", "worldAllBalls", "calculateAllBallsForWorld failed: ${e.javaClass.simpleName}: ${e.message}")
+            emptyList()
+        }
+    }
+    
+    private fun calculateAllBallsForWorldInternal(entity: PokemonEntity): List<BallCatchRate> {
+        val minecraft = Minecraft.getInstance()
+        val player = minecraft.player ?: return emptyList()
+        val level = minecraft.level ?: return emptyList()
+        
+        val pokemon = entity.pokemon
+        val ctx = BallContextFactory.fromWorldPokemon(entity, player, level)
+        val reliability = CatchRatePredictionReliability.analyzeWorldTarget(entity)
+        
+        val baseCatchRate = SpeciesCatchRateCache.getCatchRate(pokemon.species, ctx.pokemonAspects).toFloat()
+        val isEstimate = SpeciesCatchRateCache.isEstimate(pokemon.species, ctx.pokemonAspects)
+        val maxHp = pokemon.hp.toFloat()
+        val currentHp = pokemon.currentHealth.toFloat()
+        val statusMult = CatchRateFormula.getStatusMultiplier(BallContextFactory.getEffectiveStatusPath(entity))
+        val levelBonus = CatchRateFormula.getLowLevelBonus(pokemon.level)
+        val externalCatchRateMultiplier = ExternalCatchRateModifiers.combinedMultiplier(
+            ExternalCatchRateModifiers.collect(player)
+        )
+        
+        return comparableBalls().map { ballId ->
+            val result = BallMultiplierCalculator.calculate(ballId, ctx)
+            
+            val catchChance = CatchRateFormula.calculateCatchPercentage(
+                baseCatchRate = baseCatchRate,
+                maxHp = maxHp,
+                currentHp = currentHp,
+                ballMultiplier = result.multiplier,
+                statusMultiplier = statusMult,
+                levelBonus = levelBonus,
+                inBattle = false,
+                externalCatchRateMultiplier = externalCatchRateMultiplier
+            )
+            
+            val isFormulaGuaranteed = result.isGuaranteed || catchChance >= 100F
+            val finalChance = if (isFormulaGuaranteed) 100.0 else catchChance.toDouble().coerceIn(0.0, 100.0)
+            
+            BallCatchRate(
+                ballName = ballId,
+                displayName = CatchRateFormula.formatBallName(ballId),
+                catchRate = finalChance,
+                multiplier = result.multiplier.toDouble(),
+                conditionMet = result.conditionMet,
+                reason = result.reason,
+                isGuaranteed = isFormulaGuaranteed,
+                isCatchRateEstimate = isEstimate,
+                isPredictionReliable = reliability.isReliable
+            )
+        }.sortedByDescending { it.catchRate }
+    }
+    
+    /**
+     * Get a WILD Pokemon entity the player is looking at.
+     * Cached to avoid expensive entity queries every frame.
+     */
+    fun getLookedAtPokemon(): PokemonEntity? {
+        lookupFrameCounter++
+        
+        if ((lookupFrameCounter - lastPokemonLookupFrame) < POKEMON_LOOKUP_INTERVAL_FRAMES) {
+            val cached = cachedLookedAtPokemon
+            if (cached != null && cached.isAlive) return cached
+        }
+        
+        lastPokemonLookupFrame = lookupFrameCounter
+        cachedLookedAtPokemon = findLookedAtPokemon()
+        return cachedLookedAtPokemon
+    }
+    
+    private fun findLookedAtPokemon(): PokemonEntity? {
+        val minecraft = Minecraft.getInstance()
+        val player = minecraft.player ?: return null
+        val level = minecraft.level ?: return null
+        
+        // First try the crosshair target
+        val hitResult = minecraft.hitResult
+        if (hitResult != null && hitResult.type == HitResult.Type.ENTITY) {
+            val entityHit = hitResult as EntityHitResult
+            val entity = entityHit.entity
+            if (entity is PokemonEntity) {
+                val pokemonOwner = entity.pokemon.getOwnerUUID()
+                val entityOwner = entity.ownerUUID
+                if (pokemonOwner == null && entityOwner == null) return entity
+                CatchRateMod.debugOnChange("OwnedSkip", "${entity.uuid}",
+                    "Skipping owned Pokemon: ${entity.pokemon.species.name}")
+                return null
+            }
+        }
+        
+        // Fallback: Check nearby Pokemon via look direction
+        val lookVec = player.lookAngle
+        val eyePos = player.eyePosition
+        val maxDistance = 8.0
+        
+        val nearbyPokemon = level.getEntitiesOfClass(
+            PokemonEntity::class.java,
+            player.boundingBox.inflate(maxDistance)
+        ) { it.pokemon.getOwnerUUID() == null && it.ownerUUID == null }
+        
+        var closestPokemon: PokemonEntity? = null
+        var closestDistance = maxDistance
+        
+        for (pokemon in nearbyPokemon) {
+            val toEntity = pokemon.position().add(0.0, pokemon.bbHeight / 2.0, 0.0).subtract(eyePos)
+            val distance = toEntity.length()
+            if (distance > maxDistance) continue
+            
+            val dot = lookVec.dot(toEntity.normalize())
+            if (dot > 0.95 && distance < closestDistance) {
+                closestPokemon = pokemon
+                closestDistance = distance
+            }
+        }
+        
+        return closestPokemon
+    }
+}

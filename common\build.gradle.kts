@@ -1,0 +1,39 @@
+val fabricLoaderVersion = findProperty("fabric_loader_version")?.toString() ?: "0.16.7"
+val cobblemonVersion = findProperty("cobblemon_version")?.toString() ?: "1.7.1+1.21.1"
+val loom = extensions.getByName<net.fabricmc.loom.api.LoomGradleExtensionAPI>("loom")
+loom.mixin.defaultRefmapName.set("catchrate-display-refmap.json")
+
+architectury {
+    common("fabric")
+}
+
+dependencies {
+    modImplementation("net.fabricmc:fabric-loader:$fabricLoaderVersion")
+    annotationProcessor("org.spongepowered:mixin:0.8.7:processor")
+
+    // Cobblemon common module (compileOnly — not bundled)
+    modCompileOnly("com.cobblemon:mod:$cobblemonVersion")
+
+    // Architectury injectables for @ExpectPlatform
+    compileOnly("dev.architectury:architectury-injectables:1.0.10")
+}
+
+val generateBuildInfo by tasks.registering {
+    val outputDir = layout.buildDirectory.dir("generated/source/buildinfo")
+    val ver = project.version.toString()
+    inputs.property("version", ver)
+    outputs.dir(outputDir)
+    doLast {
+        val dir = outputDir.get().asFile.resolve("com/catchrate")
+        dir.mkdirs()
+        dir.resolve("BuildInfo.kt").writeText("package com.catchrate\n\ninternal const val BUILD_VERSION = \"$ver\"\n")
+    }
+}
+
+sourceSets.main {
+    java.srcDir(generateBuildInfo)
+}
+
+tasks.processResources {
+    inputs.property("version", project.version)
+}

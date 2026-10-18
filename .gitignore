@@ -1,21 +1,41 @@
-.gradle
-**/build/
-!**/src/**/build/
+# Gradle
+.gradle/
+.kotlin/
+build/
+out/
+bin/
 
-# Ignore Gradle GUI config
-gradle-app.setting
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.code-workspace
 
-# Avoid ignoring Gradle wrapper jar file (.jar files are usually ignored)
-!gradle-wrapper.jar
+# GitHub Copilot (AI development hints - not for public)
+.github/copilot-instructions.md
 
-# Avoid ignore Gradle wrapper properties
-!gradle-wrapper.properties
+# Fabric
+run/
+.cache/
 
-# Cache of project
-.gradletasknamecache
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
 
-# Eclipse Gradle plugin generated files
-# Eclipse Core
-.project
-# JDT-specific (Eclipse Java Development Tools)
-.classpath
+# Logs
+logs/
+*.log
+build-log.txt
+
+# Temporary / one-off files
+*.tmp
+*.bak
+*.swp
+*~
+fix_lang_files.py
+
+# Stale root artifacts
+META-INF/
